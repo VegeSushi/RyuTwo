@@ -264,7 +264,6 @@ async fn run_tcl<'d, T: Instance + 'd>(
         if args.len() >= 3 {
             let idx_res = core::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u8>().ok());
             let action = core::str::from_utf8(&args[2]).ok();
-            /*
             
             if let (Some(idx), Some(act)) = (idx_res, action) {
                 match act {
@@ -273,7 +272,6 @@ async fn run_tcl<'d, T: Instance + 'd>(
                     _ => return Err(FlowChange::Error),
                 }
             }
-            */
         }
         Ok(empty())
     });

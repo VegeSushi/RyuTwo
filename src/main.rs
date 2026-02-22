@@ -10,7 +10,19 @@ use embassy_usb::UsbDevice;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use static_cell::StaticCell;
+use core::ops::Range;
+use embassy_rp::flash::{Flash};
+use embedded_storage_async::nor_flash::MultiwriteNorFlash;
+use sequential_storage::{
+    map::{MapConfig, MapStorage},
+};
 use {defmt_rtt as _, panic_probe as _};
+
+// The offset from the start of FLASH (matching 0x101C0000 in memory.x)
+// Offset from 0x10000000 (Start of Flash chip)
+const STORAGE_BASE: u32 = 0x1C0000; 
+// Entire 256K region for the Map
+const MAP_FLASH_RANGE: Range<u32> = STORAGE_BASE..(STORAGE_BASE + 0x40000);
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -19,6 +31,9 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    let flash = Flash::<_, _, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
+    let flash = embassy_embedded_hal::adapter::BlockingAsync::new(flash);
 
     let driver = Driver::new(p.USB, Irqs);
 
@@ -55,12 +70,18 @@ async fn main(spawner: Spawner) {
 
     let usb = builder.build();
 
+    let mut map_storage = MapStorage::new(
+        flash,
+        const { MapConfig::new(MAP_FLASH_RANGE) },
+        sequential_storage::cache::KeyPointerCache::<4, u8, 8>::new(),
+    );
+
     unwrap!(spawner.spawn(usb_task(usb)));
 
     loop {
         class.wait_connection().await;
         info!("Connected");
-        let _ = handle_commands(&mut class).await;
+        let _ = handle_commands(&mut class, &mut map_storage).await;
         info!("Disconnected");
     }
 }
@@ -84,7 +105,10 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn handle_commands<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Driver<'d, T>>) -> Result<(), Disconnected> {
+async fn handle_commands<'d, T: Instance + 'd, E: defmt::Format>(
+    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
+    storage: &mut MapStorage<u8, impl MultiwriteNorFlash<Error = E>, impl sequential_storage::cache::KeyCacheImpl<u8>>,
+) -> Result<(), Disconnected> {
     let mut line_buf = [0u8; 64];
     let mut pos = 0;
 
@@ -100,6 +124,35 @@ async fn handle_commands<'d, T: Instance + 'd>(class: &mut CdcAcmClass<'d, Drive
                     
                     if command.starts_with(b"ping") {
                         class.write_packet(b"pong\r\n").await?;
+                    } else if command.starts_with(b"format") {
+                        match storage.erase_all().await {
+                            Ok(_) => {
+                                let _ = class.write_packet(b"formatted\r\n").await;
+                            }
+                            Err(_e) => {
+                                let _ = class.write_packet(b"error\r\n").await;
+                            }
+                        }
+                    } else if command.starts_with(b"test_flash") {
+                        let mut data_buffer = [0u8; 64];
+                        let key = 5u8;
+                        let test_val = "Flash Storage Working".as_bytes(); // Convert to &[u8]
+
+                        // Store the byte slice
+                        match storage.store_item(&mut data_buffer, &key, &test_val).await {
+                            Ok(_) => {
+                                // Fetch it back as a byte slice
+                                match storage.fetch_item::<&[u8]>(&mut data_buffer, &key).await {
+                                    Ok(Some(returned_bytes)) => {
+                                        class.write_packet(b"Verified: ").await?;
+                                        class.write_packet(returned_bytes).await?;
+                                        class.write_packet(b"\r\n").await?;
+                                    }
+                                    _ => { class.write_packet(b"Fetch failed\r\n").await?; }
+                                }
+                            }
+                            Err(_) => { class.write_packet(b"Store failed\r\n").await?; }
+                        }
                     } else {
                         class.write_packet(b"Unknown\r\n").await?;
                     }

@@ -124,6 +124,43 @@ async fn handle_commands<'d, T: Instance + 'd, E: defmt::Format>(
                     
                     if command.starts_with(b"ping") {
                         class.write_packet(b"pong\r\n").await?;
+                    } else if command.starts_with(b"write") {
+                        // Usage: Send "write" + 1 byte key + \n
+                        // The Pico responds with "READY", then waits for text + \0
+                        let key = command.get(5).cloned().unwrap_or(0);
+                        let _ = class.write_packet(b"READY\r\n").await;
+
+                        let mut data_buf = [0u8; 1024]; 
+                        let mut data_pos = 0;
+                        
+                        // Stream text until null terminator
+                        'stream: loop {
+                            let mut rx_buf = [0u8; 64];
+                            let n = class.read_packet(&mut rx_buf).await?;
+                            for &b in &rx_buf[..n] {
+                                if b == b'\0' || data_pos >= data_buf.len() { break 'stream; }
+                                data_buf[data_pos] = b;
+                                data_pos += 1;
+                            }
+                        }
+
+                        let mut scratch = [0u8; 1024];
+                        match storage.store_item(&mut scratch, &key, &&data_buf[..data_pos]).await {
+                            Ok(_) => { let _ = class.write_packet(b"STORED\r\n").await; }
+                            Err(_) => { let _ = class.write_packet(b"STORAGE_ERR\r\n").await; }
+                        }
+                    } else if command.starts_with(b"read") {
+                        // Usage: Send "read" + 1 byte key + \n
+                        let key = command.get(4).cloned().unwrap_or(0);
+                        let mut fetch_buf = [0u8; 1024];
+                        
+                        match storage.fetch_item::<&[u8]>(&mut fetch_buf, &key).await {
+                            Ok(Some(data)) => {
+                                let _ = class.write_packet(data).await;
+                                let _ = class.write_packet(b"\r\n").await;
+                            }
+                            _ => { let _ = class.write_packet(b"NOT_FOUND\r\n").await; }
+                        }
                     } else if command.starts_with(b"format") {
                         match storage.erase_all().await {
                             Ok(_) => {
@@ -136,12 +173,10 @@ async fn handle_commands<'d, T: Instance + 'd, E: defmt::Format>(
                     } else if command.starts_with(b"test_flash") {
                         let mut data_buffer = [0u8; 64];
                         let key = 5u8;
-                        let test_val = "Flash Storage Working".as_bytes(); // Convert to &[u8]
+                        let test_val = "Flash Storage Working".as_bytes(); 
 
-                        // Store the byte slice
                         match storage.store_item(&mut data_buffer, &key, &test_val).await {
                             Ok(_) => {
-                                // Fetch it back as a byte slice
                                 match storage.fetch_item::<&[u8]>(&mut data_buffer, &key).await {
                                     Ok(Some(returned_bytes)) => {
                                         class.write_packet(b"Verified: ").await?;

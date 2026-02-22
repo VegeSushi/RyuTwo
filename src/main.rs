@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+mod pins;
+
+use embedded_alloc::TlsfHeap as Heap;
 use defmt::{info, panic, unwrap};
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
@@ -13,10 +16,15 @@ use static_cell::StaticCell;
 use core::ops::Range;
 use embassy_rp::flash::{Flash};
 use embedded_storage_async::nor_flash::MultiwriteNorFlash;
+use embassy_time;
+use wartcl::{empty, Env, FlowChange};
 use sequential_storage::{
     map::{MapConfig, MapStorage},
 };
 use {defmt_rtt as _, panic_probe as _};
+
+#[global_allocator]
+static ALLOCATOR: Heap = Heap::empty();
 
 // The offset from the start of FLASH (matching 0x101C0000 in memory.x)
 // Offset from 0x10000000 (Start of Flash chip)
@@ -30,6 +38,19 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 32 * 1024;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        
+        // We use addr_of_mut! to get a raw pointer without creating an intermediate reference.
+        // This satisfies the new safety requirements for mutable statics.
+        unsafe {
+            let ptr = core::ptr::addr_of_mut!(HEAP_MEM) as usize;
+            ALLOCATOR.init(ptr, HEAP_SIZE);
+        }
+    }
+
     let p = embassy_rp::init(Default::default());
 
     let flash = Flash::<_, _, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
@@ -188,6 +209,22 @@ async fn handle_commands<'d, T: Instance + 'd, E: defmt::Format>(
                             }
                             Err(_) => { class.write_packet(b"Store failed\r\n").await?; }
                         }
+                    } else if command.starts_with(b"run") {
+                        let key = command.get(3).cloned().unwrap_or(0);
+                        let mut fetch_buf = [0u8; 1024]; // Buffer to hold the script from flash
+    
+                        match storage.fetch_item::<&[u8]>(&mut fetch_buf, &key).await {
+                            Ok(Some(code)) => {
+                                // Found the script! Now execute it.
+                                run_tcl(class, code).await;
+                            }
+                            Ok(None) => {
+                                let _ = class.write_packet(b"SCRIPT_NOT_FOUND\r\n").await;
+                            }
+                            Err(_) => {
+                                let _ = class.write_packet(b"FLASH_READ_ERR\r\n").await;
+                            }
+                        }
                     } else {
                         class.write_packet(b"Unknown\r\n").await?;
                     }
@@ -201,5 +238,66 @@ async fn handle_commands<'d, T: Instance + 'd, E: defmt::Format>(
                 }
             }
         }
+    }
+}
+
+async fn run_tcl<'d, T: Instance + 'd>(
+    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
+    code: &[u8],
+) {
+    let mut tcl = Env::default();
+
+    // Command: sleep <ms>
+    tcl.register(b"sleep", 0, |_, args| {
+        if let Some(arg) = args.get(1) {
+            if let Ok(ms_str) = core::str::from_utf8(arg) {
+                if let Ok(ms) = ms_str.parse::<u64>() {
+                    embassy_time::block_for(embassy_time::Duration::from_millis(ms));
+                }
+            }
+        }
+        Ok(empty())
+    });
+
+    // Command: gpio <idx> <1/0>
+    tcl.register(b"gpio", 0, |_, args| {
+        if args.len() >= 3 {
+            let idx_res = core::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<u8>().ok());
+            let action = core::str::from_utf8(&args[2]).ok();
+            /*
+            
+            if let (Some(idx), Some(act)) = (idx_res, action) {
+                match act {
+                    "high" | "1" => pins::on(idx),  // No 'p' needed!
+                    "low" | "0" => pins::off(idx), // No 'p' needed!
+                    _ => return Err(FlowChange::Error),
+                }
+            }
+            */
+        }
+        Ok(empty())
+    });
+
+    tcl.register(b"put", 0, |_, args| {
+        if let Some(arg) = args.get(1) {
+            return Ok(arg.to_vec().into()); 
+        }
+        Ok(empty())
+    });
+
+    match tcl.eval(code) {
+        Ok(result) => {
+            if !result.is_empty() {
+                let _ = class.write_packet(&result).await;
+                let _ = class.write_packet(b"\r\n").await;
+            }
+        }
+        Err(FlowChange::Error) => { let _ = class.write_packet(b"Tcl Error\r\n").await; }
+        Err(FlowChange::Return(val)) => {
+            let _ = class.write_packet(b"Returned: ").await;
+            let _ = class.write_packet(&val).await;
+            let _ = class.write_packet(b"\r\n").await;
+        }
+        _ => { let _ = class.write_packet(b"Unexpected flow change\r\n").await; }
     }
 }
